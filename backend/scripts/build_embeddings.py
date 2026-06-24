@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from pymilvus import MilvusClient
 from config.settings import settings
 from services.embedding_service import EmbeddingService
 from services.vector_service import VectorService
@@ -64,7 +65,6 @@ def main():
     vector_svc = VectorService(embedding_svc=embedding_svc)
 
     # drop and recreate collection for idempotent re-run
-    from pymilvus import MilvusClient
     client = MilvusClient(uri=settings.milvus_uri)
     if client.has_collection(settings.milvus_collection):
         client.drop_collection(settings.milvus_collection)

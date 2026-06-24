@@ -244,15 +244,25 @@ class VectorService:
         fields = [
             FieldSchema("asin", DataType.VARCHAR, is_primary=True, max_length=64),
             FieldSchema("sid", DataType.VARCHAR, max_length=32),
+            FieldSchema("dummy_vector", DataType.FLOAT_VECTOR, dim=1),  # Milvus Lite 要求至少一个向量字段
         ]
         return CollectionSchema(fields=fields, enable_dynamic_field=False)
 
     def _create_sid_collection(self):
         """创建 SID 映射集合"""
+        from pymilvus import MilvusClient
+
         schema = self._build_sid_schema()
+        index_params = MilvusClient.prepare_index_params()
+        index_params.add_index(
+            field_name="dummy_vector",
+            index_type="FLAT",
+            metric_type="COSINE",
+        )
         self._client.create_collection(
             collection_name=settings.milvus_sid_collection,
             schema=schema,
+            index_params=index_params,
         )
         self._client.load_collection(settings.milvus_sid_collection)
         print(f"[OK] Milvus collection created: {settings.milvus_sid_collection}")
@@ -275,9 +285,14 @@ class VectorService:
         """批量插入 SID 映射 [{"asin": "...", "sid": "..."}]"""
         if not self.is_available():
             raise RuntimeError("VectorService not available")
+        # 添加虚拟向量字段以满足 Milvus Lite 要求
+        rows = []
+        for m in mappings:
+            row = {**m, "dummy_vector": [0.0]}
+            rows.append(row)
         self._client.insert(
             collection_name=settings.milvus_sid_collection,
-            data=mappings,
+            data=rows,
         )
 
     def get_all_sids(self) -> list[dict]:
@@ -285,10 +300,14 @@ class VectorService:
         if not self.is_available():
             return []
         try:
-            return self._client.query(
+            results = self._client.query(
                 collection_name=settings.milvus_sid_collection,
                 output_fields=["asin", "sid"],
             )
+            # 移除可能存在的 dummy_vector 字段
+            for r in results:
+                r.pop("dummy_vector", None)
+            return results
         except Exception:
             return []
 
@@ -308,6 +327,9 @@ class VectorService:
                     filter=filter_expr,
                     output_fields=["asin", "sid"],
                 )
+                # 移除可能存在的 dummy_vector 字段
+                for r in results:
+                    r.pop("dummy_vector", None)
                 all_results.extend(results)
             except Exception:
                 continue
