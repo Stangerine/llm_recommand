@@ -1,0 +1,45 @@
+# Hidden directories (.* folders)
+.*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Environment files
+**/.env
+**/.env.local
+
+# Node
+node_modules/
+
+# Logs
+*.log
+
+# Build outputs
+dist/
+build/
+
+# Milvus local db
+products.db/
+
+# Raw data files (too large for git)
+Industrial_and_Scientific.json.gz
+Industrial_and_Scientific/
+meta_Industrial_and_Scientific.json.gz
+meta_Industrial_and_Scientific/
+
+# Processed data (generated, not source)
+backend/data/processed/
+
+# Harness internal files
+skills-lock.json

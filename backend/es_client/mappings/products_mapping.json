@@ -1,0 +1,31 @@
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "analysis": {
+      "analyzer": {
+        "product_analyzer": {
+          "type": "standard",
+          "stopwords": "_english_"
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "asin": { "type": "keyword" },
+      "title": {
+        "type": "text",
+        "analyzer": "product_analyzer",
+        "fields": { "raw": { "type": "keyword" } }
+      },
+      "description": { "type": "text", "analyzer": "product_analyzer" },
+      "category": { "type": "keyword" },
+      "brand": { "type": "keyword" },
+      "price": { "type": "float", "null_value": -1.0 },
+      "rating": { "type": "float", "null_value": 0.0 },
+      "rating_count": { "type": "integer", "null_value": 0 },
+      "sid": { "type": "keyword" }
+    }
+  }
+}
