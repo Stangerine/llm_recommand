@@ -1,4 +1,4 @@
-"""Batch embed all products into Milvus.
+"""Batch embed all products into Milvus and build SID mapping collection.
 
 Usage:
     cd backend
@@ -36,6 +36,12 @@ def load_products(path: str) -> list[dict]:
     return products
 
 
+def load_sid_mapping(path: str) -> dict:
+    """Load SID mapping from json file."""
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def main():
     products_path = Path(settings.products_path)
     if not products_path.exists():
@@ -63,17 +69,21 @@ def main():
     if client.has_collection(settings.milvus_collection):
         client.drop_collection(settings.milvus_collection)
         print(f"Dropped existing collection: {settings.milvus_collection}")
+    if client.has_collection(settings.milvus_sid_collection):
+        client.drop_collection(settings.milvus_sid_collection)
+        print(f"Dropped existing collection: {settings.milvus_sid_collection}")
     del client
 
     # initialize fresh collection
     import asyncio
     asyncio.run(vector_svc.initialize())
 
-    # batch insert
+    # ── 构建商品嵌入 ──────────────────────────────────────────
     batch_size = 500
     total = len(products)
     start_time = time.time()
 
+    print(f"\n[{total} products] Building product embeddings...")
     for i in range(0, total, batch_size):
         batch = products[i : i + batch_size]
         vector_svc.insert_batch(batch)
@@ -84,7 +94,34 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"\nDone! Embedded {total} products in {elapsed:.1f}s")
-    print(f"Collection: {settings.milvus_collection}")
+
+    # ── 构建 SID 映射 ─────────────────────────────────────────
+    sid_path = Path(settings.sid_mapping_path)
+    if sid_path.exists():
+        print(f"\nLoading SID mapping from {sid_path}...")
+        sid_data = load_sid_mapping(str(sid_path))
+        asin2sid = sid_data["asin2sid"]
+        print(f"Loaded {len(asin2sid)} SID mappings")
+
+        # 构建批量插入数据
+        sid_rows = [{"asin": asin, "sid": sid} for asin, sid in asin2sid.items()]
+
+        sid_start = time.time()
+        print(f"Inserting {len(sid_rows)} SID mappings into Milvus...")
+        for i in range(0, len(sid_rows), batch_size):
+            batch = sid_rows[i : i + batch_size]
+            vector_svc.insert_sid_batch(batch)
+            done = min(i + batch_size, len(sid_rows))
+            print(f"  [{done}/{len(sid_rows)}]")
+
+        sid_elapsed = time.time() - sid_start
+        print(f"Done! Inserted {len(sid_rows)} SID mappings in {sid_elapsed:.1f}s")
+    else:
+        print(f"\n[WARN] SID mapping file not found: {sid_path}")
+        print("Run build_sid_mapping.py first to generate SID mapping.")
+
+    print(f"\nCollection: {settings.milvus_collection}")
+    print(f"SID Collection: {settings.milvus_sid_collection}")
     print(f"Embedding model: {settings.embedding_model}")
     print(f"Dimension: {settings.embedding_dim}")
 

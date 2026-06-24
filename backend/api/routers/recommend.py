@@ -36,7 +36,7 @@ async def recommend(req: RecommendRequest, request: Request):
 
     # 1. ASIN → SID 序列
     start_sid = time.time()
-    history_sids = sid_svc.asins_to_sids(req.history_asins)
+    history_sids = await sid_svc.asins_to_sids(req.history_asins)
     sid_hit = len(history_sids) > 0
     metrics.record_sid_hit(sid_hit)
 
@@ -55,7 +55,7 @@ async def recommend(req: RecommendRequest, request: Request):
     logger.info("recommend_debug", history_sids=history_sids, candidate_sids=candidate_sids)
 
     # 3. SID → ASIN
-    candidate_asins = sid_svc.sids_to_asins(candidate_sids)
+    candidate_asins = await sid_svc.sids_to_asins(candidate_sids)
     logger.info("recommend_sid_to_asin", candidate_asins=candidate_asins, count=len(candidate_asins))
     if not candidate_asins:
         metrics.record_recommend_empty()

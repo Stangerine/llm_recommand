@@ -37,6 +37,7 @@ Industrial_and_Scientific.json.gz
 Industrial_and_Scientific/
 meta_Industrial_and_Scientific.json.gz
 meta_Industrial_and_Scientific/
+backend/data/raw/
 
 # Processed data (generated, not source)
 backend/data/processed/

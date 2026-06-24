@@ -50,20 +50,12 @@ async def list_products(
     category: str | None = None,
 ):
     """获取商品列表（分页）"""
-    es_client = request.app.state.es_client
+    vector_svc = request.app.state.vector_svc
 
-    # 从本地缓存获取商品
-    products = list(es_client._products_cache.values())
-
-    # 按分类过滤
-    if category:
-        products = [p for p in products if category.lower() in p.get('category', '').lower()]
-
-    # 计算分页
-    total = len(products)
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_products = products[start:end]
+    # 从 Milvus 分页查询
+    page_products, total = vector_svc.list_products(
+        page=page, page_size=page_size, category=category
+    )
 
     return ProductListResponse(
         products=[ProductDetail(**p) for p in page_products],
@@ -80,12 +72,21 @@ async def search_products(
     q: str = Query(..., min_length=1),
     category: str | None = None,
     size: int = Query(default=20, ge=1, le=100),
-    mode: str = Query(default="keyword", pattern="^(keyword|vector|hybrid)$"),
+    mode: str = Query(default="hybrid", pattern="^(keyword|vector|hybrid)$"),
 ):
-    """搜索商品 - keyword / vector / hybrid 模式"""
+    """搜索商品 - keyword / vector / hybrid 模式（默认 hybrid）"""
     es_client = request.app.state.es_client
     embedding_svc = request.app.state.embedding_svc
     vector_svc = request.app.state.vector_svc
+
+    if mode == "keyword":
+        results = await es_client.search_products(q, size=size, category=category)
+        return SearchResponse(
+            results=[ProductDetail(**p) for p in results],
+            total=len(results),
+            query=q,
+            search_mode="keyword",
+        )
 
     if mode == "vector":
         if not vector_svc.is_available():
@@ -99,40 +100,30 @@ async def search_products(
             search_mode="vector",
         )
 
-    if mode == "hybrid":
-        # over-fetch from both sources for fusion
-        fetch_size = size * 2
-        es_results = await es_client.search_products(q, size=fetch_size, category=category)
+    # default: hybrid — ES 关键词 + Milvus 向量，RRF 融合
+    fetch_size = size * 2
+    es_results = await es_client.search_products(q, size=fetch_size, category=category)
 
-        vector_hits: list[dict] = []
-        if vector_svc.is_available():
-            query_vec = embedding_svc.encode_query(q)
-            vector_hits = vector_svc.search(query_vec, top_k=fetch_size, category=category)
+    vector_hits: list[dict] = []
+    if vector_svc.is_available():
+        query_vec = embedding_svc.encode_query(q)
+        vector_hits = vector_svc.search(query_vec, top_k=fetch_size, category=category)
 
-        # fallback to keyword-only if vector unavailable
-        if not vector_hits:
-            return SearchResponse(
-                results=[ProductDetail(**p) for p in es_results[:size]],
-                total=min(len(es_results), size),
-                query=q,
-                search_mode="keyword",
-            )
-
-        fused = rrf_fusion(es_results, vector_hits, limit=size)
+    # 向量不可用时降级为纯关键词
+    if not vector_hits:
         return SearchResponse(
-            results=[ProductDetail(**h) for h in fused],
-            total=len(fused),
+            results=[ProductDetail(**p) for p in es_results[:size]],
+            total=min(len(es_results), size),
             query=q,
-            search_mode="hybrid",
+            search_mode="keyword",
         )
 
-    # default: keyword
-    results = await es_client.search_products(q, size=size, category=category)
+    fused = rrf_fusion(es_results, vector_hits, limit=size)
     return SearchResponse(
-        results=[ProductDetail(**p) for p in results],
-        total=len(results),
+        results=[ProductDetail(**h) for h in fused],
+        total=len(fused),
         query=q,
-        search_mode="keyword",
+        search_mode="hybrid",
     )
 
 

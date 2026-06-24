@@ -17,21 +17,32 @@ from es_client.client import ESClient
 from models.recommender_inference import RecommenderInference
 from config.settings import settings
 
-_sid_svc = SIDService()
-_es_client = ESClient()
-_recommender = RecommenderInference()
 _cache_svc = CacheService()
 _embedding_svc = EmbeddingService()
 _vector_svc = VectorService(embedding_svc=_embedding_svc)
+_sid_svc = SIDService(vector_service=_vector_svc, cache_service=_cache_svc)
+_es_client = ESClient(vector_service=_vector_svc, cache_service=_cache_svc)
+_recommender = RecommenderInference()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await _sid_svc.initialize()
+    # 1. 连接 Redis
     await _cache_svc.initialize()
-    _recommender.load(list(_sid_svc.sid2asin.keys()))
+
+    # 2. 加载嵌入模型
     _embedding_svc.load()
+
+    # 3. 初始化 Milvus（products + sid_mapping 集合）
     await _vector_svc.initialize()
+
+    # 4. SID 服务就绪（按需查询，不全量加载）
+    await _sid_svc.initialize()
+
+    # 5. 加载推荐模型（需要有效 SID 列表）
+    valid_sids = _sid_svc.get_all_valid_sids()
+    _recommender.load(valid_sids)
+
     app.state.sid_svc = _sid_svc
     app.state.es_client = _es_client
     app.state.recommender = _recommender

@@ -5,85 +5,81 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config.settings import settings
 
-# 尝试导入 elasticsearch
-try:
-    from elasticsearch import AsyncElasticsearch
-    ES_AVAILABLE = True
-except ImportError:
-    ES_AVAILABLE = False
-
 
 class ESClient:
-    """Elasticsearch 客户端封装"""
+    """商品客户端：Milvus 主存储 + Redis 热点缓存 + ES 全文检索"""
 
-    def __init__(self):
+    def __init__(self, vector_service=None, cache_service=None):
+        self._vector_svc = vector_service
+        self._cache_svc = cache_service
+        self.use_simulation = True  # 默认不连 ES
         self.client = None
-        self.index = settings.es_index_name
-        self.use_simulation = not ES_AVAILABLE
-        self._products_cache = {}  # 本地商品缓存
 
-        if ES_AVAILABLE:
-            try:
-                self.client = AsyncElasticsearch(
-                    settings.es_host, request_timeout=settings.es_timeout
-                )
-            except Exception as e:
-                print(f"[WARN] ES 连接失败: {e}，使用本地数据模式")
-                self.use_simulation = True
-
-        # 无论是否连接ES，都加载本地商品数据作为备用
-        self._load_local_products()
-
-    def _load_local_products(self):
-        """加载本地商品数据到缓存"""
+        # 尝试连接 ES（用于全文检索）
         try:
-            products_path = Path(settings.products_path)
-            if products_path.exists():
-                with open(products_path, encoding='utf-8') as f:
-                    for line in f:
-                        p = json.loads(line)
-                        self._products_cache[p['asin']] = p
-                print(f"[OK] 加载本地商品数据: {len(self._products_cache):,} 个")
+            from elasticsearch import AsyncElasticsearch
+            self.client = AsyncElasticsearch(
+                settings.es_host, request_timeout=settings.es_timeout
+            )
+            self.use_simulation = False
         except Exception as e:
-            print(f"[WARN] 加载本地商品失败: {e}")
+            print(f"[WARN] ES 连接失败: {e}，全文检索降级")
 
     async def get_products_by_asins(self, asins: list[str]) -> list[dict]:
-        """mget 批量精确回查——推荐流水线末端核心方法。"""
-        # 优先使用本地缓存（数据已加载）
-        if self._products_cache:
-            results = []
-            for asin in asins:
-                if asin in self._products_cache:
-                    results.append(self._products_cache[asin])
-                else:
-                    # 找不到时返回基本信息
-                    results.append({
-                        "asin": asin,
-                        "title": f"商品 {asin}",
-                        "description": "",
-                        "category": "",
-                        "brand": "",
-                        "price": None,
-                        "rating": None,
-                        "rating_count": 0,
-                    })
-            return results
+        """批量精确回查——推荐流水线末端核心方法。"""
+        result_map = {}
+        missing = list(asins)
 
-        # 本地缓存为空时使用ES
-        if not self.use_simulation and self.client is not None:
+        # 1. 批量查 Redis
+        if self._cache_svc and missing:
+            cached = await self._cache_svc.get_products_batch(missing)
+            result_map.update(cached)
+            missing = [a for a in missing if a not in cached]
+
+        # 2. 批量查 Milvus
+        if self._vector_svc and self._vector_svc.is_available() and missing:
+            milvus_results = self._vector_svc.get_by_asins(missing)
+            to_cache = {}
+            for r in milvus_results:
+                asin = r.get("asin", "")
+                if asin:
+                    result_map[asin] = r
+                    to_cache[asin] = r
+            if self._cache_svc and to_cache:
+                await self._cache_svc.set_products_batch(list(to_cache.values()))
+            missing = [a for a in missing if a not in to_cache]
+
+        # 3. ES mget 降级（如果 ES 可用）
+        if not self.use_simulation and self.client is not None and missing:
             try:
-                resp = await self.client.mget(index=self.index, body={"ids": asins})
-                return [hit["_source"] for hit in resp["docs"] if hit.get("found")]
-            except Exception as e:
-                print(f"ES mget 错误: {e}")
+                resp = await self.client.mget(index=settings.es_index_name, body={"ids": missing})
+                for hit in resp["docs"]:
+                    if hit.get("found"):
+                        result_map[hit["_source"]["asin"]] = hit["_source"]
+            except Exception:
+                pass
 
-        return []
+        # 4. 组装结果（保持原顺序）
+        return [result_map.get(a, self._placeholder(a)) for a in asins]
+
+    @staticmethod
+    def _placeholder(asin: str) -> dict:
+        return {
+            "asin": asin,
+            "title": f"商品 {asin}",
+            "description": "",
+            "category": "",
+            "brand": "",
+            "price": None,
+            "rating": None,
+            "rating_count": 0,
+        }
 
     async def search_products(
         self, query: str, size: int = 10, category: str | None = None
     ) -> list[dict]:
         """全文搜索，供前端搜索页调用。"""
-        # 优先使用ES
+        # 优先使用 ES
         if not self.use_simulation and self.client is not None:
             try:
                 must = [
@@ -98,25 +94,32 @@ class ESClient:
                     must.append({"term": {"category": category}})
 
                 resp = await self.client.search(
-                    index=self.index,
+                    index=settings.es_index_name,
                     body={"query": {"bool": {"must": must}}, "size": size},
                 )
                 return [hit["_source"] for hit in resp["hits"]["hits"]]
             except Exception as e:
                 print(f"ES search 错误: {e}")
 
-        # 从本地缓存搜索
-        query_lower = query.lower()
-        results = []
-        for p in self._products_cache.values():
-            if len(results) >= size:
-                break
-            # 简单的文本匹配
-            searchable = f"{p.get('title', '')} {p.get('description', '')} {p.get('brand', '')} {p.get('category', '')}".lower()
-            if query_lower in searchable:
-                results.append(p)
+        # 降级：从 Milvus 查询后做内存子串匹配
+        if self._vector_svc and self._vector_svc.is_available():
+            try:
+                # 获取一批商品做文本匹配（简单降级）
+                all_products, _ = self._vector_svc.list_products(page=1, page_size=500)
+                query_lower = query.lower()
+                results = []
+                for p in all_products:
+                    if len(results) >= size:
+                        break
+                    searchable = f"{p.get('title', '')} {p.get('description', '')} {p.get('brand', '')} {p.get('category', '')}".lower()
+                    if query_lower in searchable:
+                        if not category or category.lower() in p.get('category', '').lower():
+                            results.append(p)
+                return results
+            except Exception:
+                pass
 
-        return results
+        return []
 
     async def close(self):
         """关闭连接"""

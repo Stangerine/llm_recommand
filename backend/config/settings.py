@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_recommend_ttl: int = 300  # 推荐结果缓存 5 分钟
     redis_sid_ttl: int = 86400  # SID 映射缓存 24 小时
+    redis_product_ttl: int = 3600  # 商品缓存 1 小时
 
     # 模型
     model_base: str = "Qwen/Qwen2.5-3B"
@@ -26,6 +27,7 @@ class Settings(BaseSettings):
     # Milvus
     milvus_uri: str = "products.db"
     milvus_collection: str = "products"
+    milvus_sid_collection: str = "sid_mapping"
 
     # Embedding
     embedding_model: str = "BAAI/bge-base-en-v1.5"
