@@ -68,7 +68,7 @@ def clean_text(text: str, max_len: int = 2000) -> str:
 def process_product_meta(raw_path: str, output_path: str):
     """清洗商品元数据，输出 products.jsonl"""
     records = []
-    skipped = {"no_title": 0, "no_asin": 0, "bad_price": 0}
+    skipped = {"no_asin": 0, "no_title": 0, "no_desc": 0, "no_price": 0}
 
     with open(raw_path) as f:
         for line in f:
@@ -116,31 +116,33 @@ def process_product_meta(raw_path: str, output_path: str):
             rating = clean_rating(item.get("average_rating") or item.get("rating"))
             rating_count = clean_rating_count(item.get("rating_number") or item.get("rating_count"))
 
+            # 必填字段：asin、标题、描述、价格
+            if not description:
+                skipped["no_desc"] += 1
+                continue
+            if price is None:
+                skipped["no_price"] += 1
+                continue
+
             records.append({
                 "asin": asin,
                 "title": title,
                 "description": description,
-                "category": category,
-                "brand": brand,
+                "category": category or "",
+                "brand": brand or "",
                 "price": price,
-                "rating": rating,
+                "rating": rating if rating is not None else 0.0,
                 "rating_count": rating_count,
             })
 
     df = pd.DataFrame(records).drop_duplicates(subset=["asin"])
 
-    # 统计清洗结果
-    null_price = df["price"].isna().sum()
-    null_rating = df["rating"].isna().sum()
-    empty_desc = (df["description"] == "").sum()
-    empty_cat = (df["category"] == "").sum()
-
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     df.to_json(output_path, orient="records", lines=True, force_ascii=False)
 
-    print(f"[OK] 商品总数: {len(df)}")
-    print(f"[INFO] 跳过: 无标题={skipped['no_title']}, 无ASIN={skipped['no_asin']}")
-    print(f"[INFO] 空值统计: 价格={null_price}, 评分={null_rating}, 描述={empty_desc}, 分类={empty_cat}")
+    print(f"[OK] 合格商品总数: {len(df)}")
+    print(f"[INFO] 跳过: 无ASIN={skipped['no_asin']}, 无标题={skipped['no_title']}, "
+          f"无描述={skipped['no_desc']}, 无价格={skipped['no_price']}")
 
 
 if __name__ == "__main__":

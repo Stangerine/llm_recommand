@@ -17,8 +17,8 @@ def create_index():
         mapping = json.load(f)
 
     if es.indices.exists(index=settings.es_index_name):
-        print(f"[WARN] 索引 {settings.es_index_name} 已存在，跳过创建")
-        return
+        es.indices.delete(index=settings.es_index_name)
+        print(f"[OK] 已删除旧索引 {settings.es_index_name}")
 
     es.indices.create(index=settings.es_index_name, body=mapping)
     print(f"[OK] 索引 {settings.es_index_name} 创建成功")

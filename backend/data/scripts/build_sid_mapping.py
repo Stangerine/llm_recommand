@@ -24,7 +24,7 @@ def build_sid_mapping(
     encoder = RQVAEEncoder(ckpt_path=rqvae_ckpt)
     asin2sid, sid2asin = {}, {}
 
-    with open(products_path) as f:
+    with open(products_path, encoding="utf-8") as f:
         products = [json.loads(l) for l in f]
 
     for i in range(0, len(products), batch_size):

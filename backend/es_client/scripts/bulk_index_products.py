@@ -24,11 +24,11 @@ def bulk_index(
 
     es = Elasticsearch(es_host)
 
-    with open(sid_mapping_path) as f:
+    with open(sid_mapping_path, encoding="utf-8") as f:
         sid_map = json.load(f)["asin2sid"]
 
     def gen_actions():
-        with open(products_path) as f:
+        with open(products_path, encoding="utf-8") as f:
             for line in f:
                 p = json.loads(line)
                 yield {

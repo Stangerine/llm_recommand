@@ -83,8 +83,9 @@ python data/scripts/build_sid_mapping.py
 
 ### Elasticsearch
 ```bash
-python elasticsearch/scripts/create_index.py
-python elasticsearch/scripts/bulk_index_products.py
+cd backend
+python es_client/scripts/create_index.py
+python es_client/scripts/bulk_index_products.py
 ```
 
 ### Milvus Embeddings

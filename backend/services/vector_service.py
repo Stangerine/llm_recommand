@@ -5,6 +5,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Milvus Lite on Windows: os.rename cannot overwrite an existing file.
+import os
+_orig_rename = os.rename
+def _safe_rename(src, dst):
+    try:
+        _orig_rename(src, dst)
+    except FileExistsError:
+        os.replace(src, dst)
+os.rename = _safe_rename
+
 from config.settings import settings
 
 
@@ -68,7 +78,7 @@ class VectorService:
             FieldSchema("asin", DataType.VARCHAR, is_primary=True, max_length=64),
             FieldSchema("title", DataType.VARCHAR, max_length=2048),
             FieldSchema("description", DataType.VARCHAR, max_length=4096),
-            FieldSchema("category", DataType.VARCHAR, max_length=256),
+            FieldSchema("category", DataType.VARCHAR, max_length=1024),
             FieldSchema("brand", DataType.VARCHAR, max_length=256),
             FieldSchema("price", DataType.FLOAT),
             FieldSchema("rating", DataType.FLOAT),
@@ -97,7 +107,7 @@ class VectorService:
                 "asin": p["asin"],
                 "title": p.get("title", ""),
                 "description": (p.get("description", "") or "")[:4096],
-                "category": p.get("category", ""),
+                "category": (p.get("category", "") or "")[:1024],
                 "brand": p.get("brand", ""),
                 "price": float(p.get("price", 0) or 0),
                 "rating": float(p.get("rating", 0) or 0),

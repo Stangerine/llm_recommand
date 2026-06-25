@@ -15,6 +15,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Milvus Lite on Windows: os.rename cannot overwrite an existing file.
+# Patch it to use os.replace which works on all platforms.
+import os
+_orig_rename = os.rename
+def _safe_rename(src, dst):
+    try:
+        _orig_rename(src, dst)
+    except FileExistsError:
+        os.replace(src, dst)
+os.rename = _safe_rename
+
 from pymilvus import MilvusClient
 from config.settings import settings
 from services.embedding_service import EmbeddingService
@@ -65,14 +76,13 @@ def main():
     vector_svc = VectorService(embedding_svc=embedding_svc)
 
     # drop and recreate collection for idempotent re-run
-    client = MilvusClient(uri=settings.milvus_uri)
-    if client.has_collection(settings.milvus_collection):
-        client.drop_collection(settings.milvus_collection)
-        print(f"Dropped existing collection: {settings.milvus_collection}")
-    if client.has_collection(settings.milvus_sid_collection):
-        client.drop_collection(settings.milvus_sid_collection)
-        print(f"Dropped existing collection: {settings.milvus_sid_collection}")
-    del client
+    # Milvus Lite on Windows has a bug with os.rename on existing files;
+    # delete the entire db directory to ensure a clean slate.
+    import shutil
+    db_path = Path(settings.milvus_uri)
+    if db_path.exists():
+        shutil.rmtree(db_path)
+        print(f"Removed existing Milvus db: {db_path}")
 
     # initialize fresh collection
     import asyncio

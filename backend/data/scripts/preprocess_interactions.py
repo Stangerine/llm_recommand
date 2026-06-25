@@ -14,9 +14,9 @@ def process_interactions(
     with open(raw_path) as f:
         for line in f:
             rec = json.loads(line)
-            user_actions[rec["user_id"]].append({
-                "asin": rec["parent_asin"],
-                "timestamp": rec["timestamp"],
+            user_actions[rec["reviewerID"]].append({
+                "asin": rec["asin"],
+                "timestamp": rec["unixReviewTime"],
             })
 
     results = []
