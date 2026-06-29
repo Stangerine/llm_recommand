@@ -1,45 +1,14 @@
-import json
-from collections import defaultdict
-from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from api.dependencies import get_search_service
 from api.schemas.products import ProductDetail, SearchResponse, ProductListResponse
-from config.settings import settings
+from services.search_service import SearchService
 
 router = APIRouter()
-
-
-def rrf_fusion(
-    es_results: list[dict],
-    vector_results: list[dict],
-    k: int = 60,
-    limit: int = 10,
-) -> list[dict]:
-    """Reciprocal Rank Fusion merging ES and Milvus results."""
-    scores: dict[str, float] = {}
-    asin_to_product: dict[str, dict] = {}
-
-    for rank, item in enumerate(es_results):
-        asin = item["asin"]
-        scores[asin] = scores.get(asin, 0) + 1.0 / (k + rank + 1)
-        asin_to_product[asin] = item
-
-    for rank, item in enumerate(vector_results):
-        asin = item["asin"]
-        scores[asin] = scores.get(asin, 0) + 1.0 / (k + rank + 1)
-        if asin not in asin_to_product:
-            asin_to_product[asin] = item
-
-    ranked = sorted(scores.items(), key=lambda x: -x[1])
-    results = []
-    for asin, score in ranked[:limit]:
-        product = asin_to_product[asin].copy()
-        product["rrf_score"] = score
-        results.append(product)
-    return results
 
 
 @router.get("/products", response_model=ProductListResponse)
@@ -52,7 +21,6 @@ async def list_products(
     """获取商品列表（分页）"""
     vector_svc = request.app.state.vector_svc
 
-    # 从 Milvus 分页查询
     page_products, total = vector_svc.list_products(
         page=page, page_size=page_size, category=category
     )
@@ -68,62 +36,25 @@ async def list_products(
 
 @router.get("/products/search", response_model=SearchResponse)
 async def search_products(
-    request: Request,
     q: str = Query(..., min_length=1),
     category: str | None = None,
     size: int = Query(default=20, ge=1, le=100),
     mode: str = Query(default="hybrid", pattern="^(keyword|vector|hybrid)$"),
+    search_svc: SearchService = Depends(get_search_service),
 ):
     """搜索商品 - keyword / vector / hybrid 模式（默认 hybrid）"""
-    es_client = request.app.state.es_client
-    embedding_svc = request.app.state.embedding_svc
-    vector_svc = request.app.state.vector_svc
-
-    if mode == "keyword":
-        results = await es_client.search_products(q, size=size, category=category)
-        return SearchResponse(
-            results=[ProductDetail(**p) for p in results],
-            total=len(results),
-            query=q,
-            search_mode="keyword",
+    try:
+        results, effective_mode = await search_svc.search(
+            query=q, mode=mode, category=category, size=size
         )
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
 
-    if mode == "vector":
-        if not vector_svc.is_available():
-            raise HTTPException(503, "Vector search not available")
-        query_vec = embedding_svc.encode_query(q)
-        hits = vector_svc.search(query_vec, top_k=size, category=category)
-        return SearchResponse(
-            results=[ProductDetail(**h) for h in hits],
-            total=len(hits),
-            query=q,
-            search_mode="vector",
-        )
-
-    # default: hybrid — ES 关键词 + Milvus 向量，RRF 融合
-    fetch_size = size * 2
-    es_results = await es_client.search_products(q, size=fetch_size, category=category)
-
-    vector_hits: list[dict] = []
-    if vector_svc.is_available():
-        query_vec = embedding_svc.encode_query(q)
-        vector_hits = vector_svc.search(query_vec, top_k=fetch_size, category=category)
-
-    # 向量不可用时降级为纯关键词
-    if not vector_hits:
-        return SearchResponse(
-            results=[ProductDetail(**p) for p in es_results[:size]],
-            total=min(len(es_results), size),
-            query=q,
-            search_mode="keyword",
-        )
-
-    fused = rrf_fusion(es_results, vector_hits, limit=size)
     return SearchResponse(
-        results=[ProductDetail(**h) for h in fused],
-        total=len(fused),
+        results=[ProductDetail(**p) for p in results],
+        total=len(results),
         query=q,
-        search_mode="hybrid",
+        search_mode=effective_mode,
     )
 
 

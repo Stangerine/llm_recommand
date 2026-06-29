@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from api.routers.products import rrf_fusion
+from services.search_service import _rrf_fusion as rrf_fusion
 
 
 class TestRRFFusion:

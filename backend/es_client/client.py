@@ -7,7 +7,7 @@ from config.settings import settings
 
 
 class ESClient:
-    """商品客户端：Milvus 主存储 + Redis 热点缓存 + ES 全文检索"""
+    """商品客户端：ES 主存储 + Redis 热点缓存，Milvus 仅作搜索降级"""
 
     def __init__(self, vector_service=None, cache_service=None):
         self._vector_svc = vector_service
@@ -26,7 +26,7 @@ class ESClient:
             print(f"[WARN] ES 连接失败: {e}，全文检索降级")
 
     async def get_products_by_asins(self, asins: list[str]) -> list[dict]:
-        """批量精确回查——推荐流水线末端核心方法。"""
+        """批量精确回查——推荐流水线末端核心方法。Redis 缓存 → ES 查询。"""
         result_map = {}
         missing = list(asins)
 
@@ -36,30 +36,23 @@ class ESClient:
             result_map.update(cached)
             missing = [a for a in missing if a not in cached]
 
-        # 2. 批量查 Milvus
-        if self._vector_svc and self._vector_svc.is_available() and missing:
-            milvus_results = self._vector_svc.get_by_asins(missing)
-            to_cache = {}
-            for r in milvus_results:
-                asin = r.get("asin", "")
-                if asin:
-                    result_map[asin] = r
-                    to_cache[asin] = r
-            if self._cache_svc and to_cache:
-                await self._cache_svc.set_products_batch(list(to_cache.values()))
-            missing = [a for a in missing if a not in to_cache]
-
-        # 3. ES mget 降级（如果 ES 可用）
+        # 2. ES mget 回查（主数据源）
         if not self.use_simulation and self.client is not None and missing:
             try:
                 resp = await self.client.mget(index=settings.es_index_name, body={"ids": missing})
+                to_cache = {}
                 for hit in resp["docs"]:
                     if hit.get("found"):
-                        result_map[hit["_source"]["asin"]] = hit["_source"]
+                        source = hit["_source"]
+                        result_map[source["asin"]] = source
+                        to_cache[source["asin"]] = source
+                if self._cache_svc and to_cache:
+                    await self._cache_svc.set_products_batch(list(to_cache.values()))
+                missing = [a for a in missing if a not in to_cache]
             except Exception:
                 pass
 
-        # 4. 组装结果（保持原顺序）
+        # 3. 组装结果（保持原顺序，查不到的用占位符）
         return [result_map.get(a, self._placeholder(a)) for a in asins]
 
     @staticmethod
