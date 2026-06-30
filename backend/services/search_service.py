@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -75,14 +76,21 @@ class SearchService:
             hits = self._vector.search(query_vec, top_k=size, category=category)
             return hits, "vector"
 
-        # hybrid (default): ES + vector with RRF fusion
+        # hybrid (default): ES + vector with RRF fusion, run in parallel
         fetch_size = size * 2
-        es_results = await self._es.search_products(query, size=fetch_size, category=category)
 
-        vector_hits: list[dict] = []
-        if self._vector.is_available():
-            query_vec = self._embedding.encode_query(query)
-            vector_hits = self._vector.search(query_vec, top_k=fetch_size, category=category)
+        async def _do_vector_search() -> list[dict]:
+            if not self._vector.is_available():
+                return []
+            query_vec = await asyncio.to_thread(self._embedding.encode_query, query)
+            return await asyncio.to_thread(
+                self._vector.search, query_vec, top_k=fetch_size, category=category
+            )
+
+        es_results, vector_hits = await asyncio.gather(
+            self._es.search_products(query, size=fetch_size, category=category),
+            _do_vector_search(),
+        )
 
         if not vector_hits:
             return es_results[:size], "keyword"

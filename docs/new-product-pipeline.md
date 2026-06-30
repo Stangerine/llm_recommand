@@ -271,6 +271,9 @@ Milvus 存储商品的语义向量（768维，bge-base-en-v1.5），支持语义
 
 ```bash
 # 方式1: 全量重建（推荐，保证一致性）
+# 脚本做两件事：
+#   ① 商品 embedding 写入 products 集合
+#   ② SID 映射写入 sid_mapping 集合
 python scripts/build_embeddings.py
 
 # 方式2: 增量插入（需自行实现）
@@ -389,4 +392,4 @@ echo "完成"
 
 ---
 
-*文档版本: v1.1 | 最后更新: 2026-06-23*
+*文档版本: v1.2 | 最后更新: 2026-06-30*

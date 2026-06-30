@@ -28,37 +28,35 @@
 │                                                                      │
 │  POST /api/v1/recommend    GET /api/v1/products/{asin}               │
 │  GET  /api/v1/products/search    POST /api/v1/behavior               │
-└─────────────────┬──────────────────────────────────┬────────────────┘
-                  │                                  │
-                  ▼                                  ▼
-┌─────────────────────────────┐    ┌──────────────────────────────────┐
-│      RecommendPipeline      │    │        Elasticsearch (:9200)     │
-│                             │    │                                  │
-│  1. ASIN → SID (内存字典)    │    │  products index                  │
-│  2. 模型推理 → 候选SID       │◄──►│  asin | title | description      │
-│  3. SID → ASIN (内存字典)    │    │  category | brand | price | sid  │
-│  4. ES/本地缓存回查          │    │                                  │
-│  5. 返回排序后Top-K          │    │  mget (精确回查)                  │
-│                             │    │  multi_match (全文搜索)           │
-└─────────────┬───────────────┘    └──────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────┐    ┌──────────────────────────────────┐
-│    Model Inference Service  │    │            Redis (:6379)         │
-│                             │    │                                  │
-│  Qwen2.5-3B + LoRA          │    │  推荐结果缓存  TTL: 5min          │
-│  Beam Search (×20 beams)    │◄──►│  SID映射缓存   TTL: 24h          │
-│  模拟模式 (无GPU时)          │    │                                  │
-└─────────────┬───────────────┘    └──────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────┐
-│      SID Mapping Service    │
-│                             │
-│  asin2sid: dict (内存)      │
-│  sid2asin: dict (内存)      │
-│  查询耗时 < 1ms              │
-└─────────────────────────────┘
+│  GET  /api/v1/products                                            │
+└─────────┬──────────┬──────────────────┬──────────────┬─────────────┘
+          │          │                  │              │
+          ▼          ▼                  ▼              ▼
+┌──────────────────┐ ┌────────────────┐ ┌────────────────────────────┐
+│ RecommendPipeline│ │ SearchService  │ │ EmbeddingService           │
+│                  │ │                │ │ (bge-base-en-v1.5, 768维)  │
+│ 1. ASIN → SID    │ │ keyword (ES)   │ └─────────────┬──────────────┘
+│ 2. 模型推理→候选SID│ │ vector (Milvus)│               │
+│ 3. SID → ASIN    │ │ hybrid (RRF)   │               ▼
+│ 4. ES+Redis 回查 │ │ 并行 ES + Milvus│ ┌────────────────────────────┐
+│ 5. 排序返回 Top-K │ └───────┬────────┘ │ Milvus Lite (VectorService) │
+└────────┬─────────┘         │          │                            │
+         │                   │          │ products 集合 (768维向量)    │
+         ▼                   ▼          │ sid_mapping 集合 (ASIN↔SID) │
+┌──────────────────┐ ┌────────────────┐ └────────────────────────────┘
+│ Model Inference  │ │ Elasticsearch  │
+│ Qwen2.5-3B+LoRA  │ │ (:9200)        │  ┌────────────────────────────┐
+│ Beam Search ×20  │ │                │  │ Redis (:6379)              │
+│ 模拟模式(降级)    │ │ products index │  │                            │
+└──────────────────┘ │ mget / search  │  │ 推荐结果缓存  TTL: 5min     │
+                     └────────────────┘  │ 商品详情缓存  TTL: 1h       │
+                                         │ SID映射缓存   TTL: 24h      │
+┌──────────────────┐                     └────────────────────────────┘
+│ SIDService       │
+│ ASIN↔SID 双向映射 │
+│ 三级:Redis→Milvus│
+│ →JSON(兜底)      │
+└──────────────────┘
 ```
 
 ### 1.2 组件职责
@@ -66,9 +64,11 @@
 | 组件 | 职责 | 数据存储 | 查询延迟 |
 |------|------|----------|----------|
 | **Elasticsearch** | 商品索引、全文搜索、批量回查 | 索引数据 | 5-20ms |
-| **Redis** | 推荐结果缓存、会话存储 | 内存KV | <1ms |
-| **SIDService** | ASIN↔SID双向映射 | 内存字典 | <1ms |
-| **本地JSONL** | 商品数据备份（ES不可用时） | 文件系统 | 1-5ms |
+| **Redis** | 推荐结果缓存、商品详情缓存、SID映射缓存 | 内存KV | <1ms |
+| **Milvus Lite** | 向量语义搜索、SID映射持久化存储 | 本地文件 | 5-30ms |
+| **EmbeddingService** | 文本向量化（bge-base-en-v1.5, 768维） | — | 10-50ms |
+| **SearchService** | 统一搜索编排（keyword/vector/hybrid + RRF融合） | — | 取决于后端 |
+| **SIDService** | ASIN↔SID双向映射（三级查询） | Redis+Milvus+JSON | <1ms |
 
 ---
 
@@ -82,24 +82,48 @@
 
 ```python
 # es_client/client.py
-async def get_products_by_asins(self, asins: list[str]) -> list[dict]:
-    """
-    mget 批量精确回查
-    - 输入: ASIN列表，如 ["B001XXXXX", "B002XXXXX"]
-    - 输出: 商品详情列表，包含title, price, brand等
-    - 延迟: 5-20ms（ES）/ 1-5ms（本地缓存）
-    """
-    # 优先使用本地缓存
-    if self._products_cache:
-        results = []
-        for asin in asins:
-            if asin in self._products_cache:
-                results.append(self._products_cache[asin])
-        return results
-    
-    # 本地缓存为空时使用ES
-    resp = await self.client.mget(index=self.index, body={"ids": asins})
-    return [hit["_source"] for hit in resp["docs"] if hit.get("found")]
+class ESClient:
+    """商品客户端：ES 主存储 + Redis 热点缓存"""
+
+    def __init__(self, vector_service=None, cache_service=None):
+        self._vector_svc = vector_service   # Milvus（搜索降级用）
+        self._cache_svc = cache_service     # Redis 缓存
+        self.use_simulation = True
+        self.client = None
+        # 尝试连接 ES...
+
+    async def get_products_by_asins(self, asins: list[str]) -> list[dict]:
+        """
+        批量精确回查——推荐流水线末端核心方法。
+        Redis 缓存 → ES mget → 占位符
+        - 输入: ASIN列表，如 ["B001XXXXX", "B002XXXXX"]
+        - 输出: 商品详情列表，保持原始 ASIN 顺序
+        - 延迟: <1ms（Redis命中）/ 5-20ms（ES）
+        """
+        result_map = {}
+        missing = list(asins)
+
+        # 1. 批量查 Redis
+        if self._cache_svc and missing:
+            cached = await self._cache_svc.get_products_batch(missing)
+            result_map.update(cached)
+            missing = [a for a in missing if a not in cached]
+
+        # 2. ES mget 回查（主数据源）
+        if not self.use_simulation and self.client is not None and missing:
+            resp = await self.client.mget(index=settings.es_index_name, body={"ids": missing})
+            to_cache = {}
+            for hit in resp["docs"]:
+                if hit.get("found"):
+                    source = hit["_source"]
+                    result_map[source["asin"]] = source
+                    to_cache[source["asin"]] = source
+            if self._cache_svc and to_cache:
+                await self._cache_svc.set_products_batch(list(to_cache.values()))
+            missing = [a for a in missing if a not in to_cache]
+
+        # 3. 组装结果（保持原顺序，查不到的用占位符）
+        return [result_map.get(a, _placeholder(a)) for a in asins]
 ```
 
 **使用场景：**
@@ -212,10 +236,10 @@ def bulk_index():
 
 ### 2.4 查询性能对比
 
-| 查询类型 | ES延迟 | 本地缓存延迟 | 说明 |
+| 查询类型 | ES延迟 | Redis缓存延迟 | 说明 |
 |----------|--------|--------------|------|
-| mget (10条) | 5-20ms | 1-5ms | 推荐结果回查 |
-| 全文搜索 | 10-50ms | 1-10ms | 用户搜索 |
+| mget (10条) | 5-20ms | <1ms | 推荐结果回查 |
+| 全文搜索 | 10-50ms | — | ES 搜索无缓存 |
 | 单条查询 | 2-10ms | <1ms | 商品详情 |
 
 ---
@@ -286,7 +310,8 @@ async def recommend(req: RecommendRequest, request: Request):
 | 缓存类型 | Key格式 | TTL | 说明 |
 |----------|---------|-----|------|
 | 推荐结果 | `recommend:{user_id}:{history_hash}` | 5分钟 | 相同历史不重复推理 |
-| SID映射 | `sid:{asin}` | 24小时 | 减少文件读取（可选） |
+| 商品详情 | `product:{asin}` | 1小时 | 推荐/搜索回查加速 |
+| SID映射 | `sid:{asin}` | 24小时 | ASIN↔SID 转换缓存 |
 
 ### 3.3 缓存命中率优化
 
@@ -387,10 +412,11 @@ GET recommend:user_abc123:a1b2c3d4
 │  Output: [{asin, title, price, brand, ...}, ...]                    │
 │                                                                      │
 │  实现:                                                               │
-│  - 本地缓存优先: 直接从内存字典获取                                   │
-│  - ES回查: mget批量查询                                              │
+│  - Redis 缓存优先: mget 批量查询商品详情                               │
+│  - ES mget: 未命中时回查，结果回填 Redis                              │
+│  - 占位符: 仍缺失的 ASIN 返回占位对象                                  │
 │                                                                      │
-│  延迟: 1-5ms (本地) / 5-20ms (ES)                                   │
+│  延迟: <1ms (Redis命中) / 5-20ms (ES)                                │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
@@ -420,27 +446,17 @@ GET recommend:user_abc123:a1b2c3d4
 用户输入 "safety gloves"
         │
         ▼
-GET /api/v1/products/search?q=safety+gloves
+GET /api/v1/products/search?q=safety+gloves&mode=hybrid
         │
         ▼
-┌───────────────────────────────────────┐
-│ ESClient.search_products("safety gloves") │
-│                                       │
-│ 1. 构建查询:                          │
-│    multi_match {                      │
-│      query: "safety gloves",          │
-│      fields: ["title^3", "description", "brand^2"]
-│    }                                  │
-│                                       │
-│ 2. 执行搜索:                          │
-│    es.search(index="industrial_products", body=...) │
-│                                       │
-│ 3. 返回结果:                          │
-│    [{asin, title, price, ...}, ...]   │
-└───────────────────────────────────────┘
+SearchService.search("safety gloves", mode="hybrid")
         │
-        ▼
-返回 SearchResponse {results: [...], total: 10}
+        ├─ keyword 模式: ES multi_match (title^3, description, brand^2)
+        ├─ vector 模式: 文本 → embedding → Milvus cosine 搜索
+        └─ hybrid 模式: ES + Milvus 并行执行 → RRF 融合
+                │
+                ▼
+返回 SearchResponse {results: [...], total: 10, mode: "hybrid"}
 ```
 
 ---
@@ -460,6 +476,23 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 REDIS_RECOMMEND_TTL=300    # 推荐缓存5分钟
 REDIS_SID_TTL=86400        # SID缓存24小时
+REDIS_PRODUCT_TTL=3600     # 商品缓存1小时
+
+# Milvus
+MILVUS_URI=products.db
+MILVUS_COLLECTION=products
+MILVUS_SID_COLLECTION=sid_mapping
+
+# Embedding
+EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+EMBEDDING_DIM=768
+EMBEDDING_BATCH_SIZE=128
+
+# 模型
+MODEL_BASE=Qwen/Qwen2.5-3B
+MODEL_DEVICE=cuda
+TOP_K=10
+BEAM_SEARCH_NUM_BEAMS=20
 ```
 
 ### 5.2 配置类 (config/settings.py)
@@ -469,18 +502,35 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env")
-    
+
     # Elasticsearch
     es_host: str = "http://localhost:9200"
     es_index_name: str = "industrial_products"
     es_timeout: int = 10
-    
+
     # Redis
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_recommend_ttl: int = 300
     redis_sid_ttl: int = 86400
-    
+    redis_product_ttl: int = 3600
+
+    # Milvus
+    milvus_uri: str = "products.db"
+    milvus_collection: str = "products"
+    milvus_sid_collection: str = "sid_mapping"
+
+    # Embedding
+    embedding_model: str = "BAAI/bge-base-en-v1.5"
+    embedding_dim: int = 768
+    embedding_batch_size: int = 128
+
+    # 模型
+    model_base: str = "Qwen/Qwen2.5-3B"
+    model_device: str = "cuda"
+    beam_search_num_beams: int = 20
+    top_k: int = 10
+
     # 数据路径
     sid_mapping_path: str = "./data/processed/sid_mapping.json"
     products_path: str = "./data/processed/products.jsonl"
@@ -554,30 +604,37 @@ redis-cli ping
 ```python
 # es_client/client.py
 class ESClient:
-    def __init__(self):
-        self._products_cache = {}  # 本地商品缓存
-        self._load_local_products()  # 启动时加载165,686个商品
-    
-    async def get_products_by_asins(self, asins):
-        # 优先使用本地缓存
-        if self._products_cache:
-            return [self._products_cache[asin] for asin in asins if asin in self._products_cache]
-        
-        # 本地缓存为空时尝试ES
-        if self.client:
+    """商品客户端：ES 主存储 + Redis 热点缓存，Milvus 仅作搜索降级"""
+
+    def __init__(self, vector_service=None, cache_service=None):
+        self._vector_svc = vector_service   # Milvus（搜索降级用）
+        self._cache_svc = cache_service     # Redis 缓存
+        self.use_simulation = True          # ES 不可用时为 True
+        self.client = None
+
+    async def search_products(self, query, size=10, category=None):
+        # 优先使用 ES
+        if not self.use_simulation and self.client is not None:
             try:
-                resp = await self.client.mget(...)
+                resp = await self.client.search(...)
                 return [...]
-            except:
+            except Exception:
                 pass
-        
-        return []  # 都不可用时返回空
+
+        # 降级：从 Milvus 取商品做内存子串匹配
+        if self._vector_svc and self._vector_svc.is_available():
+            all_products, _ = self._vector_svc.list_products(page=1, page_size=500)
+            # 对 title + description + brand 做子串匹配
+            results = [p for p in all_products if query.lower() in searchable_text(p)]
+            return results[:size]
+
+        return []
 ```
 
 **降级效果：**
-- ✅ 推荐功能正常（使用本地商品数据）
+- ✅ 商品回查正常（Redis → ES → 占位符）
 - ✅ 商品详情正常
-- ⚠️ 搜索功能较弱（简单文本匹配 vs ES全文搜索）
+- ⚠️ 搜索功能降级为 Milvus 内存子串匹配（精确度低于 ES 全文搜索）
 
 ### 7.2 Redis不可用时
 
@@ -633,7 +690,7 @@ curl http://localhost:8000/metrics
 |------|-----------|-----------|------|
 | 推荐延迟 (首次) | 600ms-2.1s | 600ms-2.1s | 主要耗时在模型推理 |
 | 推荐延迟 (缓存) | < 10ms | 600ms-2.1s | Redis缓存命中 |
-| 搜索延迟 | 10-50ms | 1-10ms | ES全文搜索 vs 本地匹配 |
+| 搜索延迟 | 10-50ms | 50-200ms | ES全文搜索 vs Milvus子串匹配 |
 | 搜索质量 | 高 | 中 | ES相关性排序 vs 简单匹配 |
 | 内存占用 | 高 | 低 | ES需要额外内存 |
 
@@ -671,4 +728,4 @@ curl http://localhost:8000/metrics
 
 ---
 
-*文档版本: v1.0 | 最后更新: 2026-06-23*
+*文档版本: v1.1 | 最后更新: 2026-06-30*
